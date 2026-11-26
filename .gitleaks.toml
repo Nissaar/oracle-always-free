@@ -1,0 +1,7 @@
+# gitleaks configuration (CI: .github/workflows/gitleaks.yml, laptop: .pre-commit-config.yaml).
+# Default ruleset. No allowlist needed today (full history scans clean). Add only the narrowest
+# [[allowlists]] entry that is truly needed, each with a comment saying why.
+title = "gitleaks config"
+
+[extend]
+useDefault = true

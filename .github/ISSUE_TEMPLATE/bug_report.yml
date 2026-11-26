@@ -1,0 +1,42 @@
+name: Bug report
+description: Something does not work as the README says
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste secrets or identifiers (account, tenancy, project and billing ids, OCIDs, e-mails, domains, tailnet names, tokens).
+        Replace them with placeholders. For a security problem use the Security tab instead (see SECURITY.md).
+  - type: input
+    id: step
+    attributes:
+      label: README or docs step
+      description: Which step or command failed?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The error message and the lines around it, redacted.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions and account type
+      description: "`tofu version`, your OS, and the plan of the cloud account (for example Always Free only, trial, pay as you go). No ids."
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Checks
+      options:
+        - label: I removed every identifier, e-mail address, token and key from this report
+          required: true

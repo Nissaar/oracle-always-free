@@ -1,0 +1,29 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+crash.log
+crash.*.log
+tfplan
+plan.txt
+
+# Local inputs (project / billing IDs)
+*.tfvars
+!*.tfvars.example
+# the node image pin holds a public image OCID and name, no secret: it IS committed (the node-image workflow proposes it as a pull request)
+!infra/node-image.auto.tfvars
+
+# Never commit credentials
+*.json
+!renovate.json
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Stack files that are config, not credentials
+!stacks/*/serve.json
+
+# Python bytecode of the offline tests
+__pycache__/

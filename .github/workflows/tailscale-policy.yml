@@ -1,0 +1,30 @@
+name: tailscale-policy
+
+# Offline check of the DRAFT tailnet policy in tailscale/ (never applied by CI: nothing here talks
+# to Tailscale). Separate from tofu.yml on purpose: no Oracle login, no plan.
+on:
+  pull_request:
+    paths:
+      - "tailscale/**"
+      - ".github/workflows/tailscale-policy.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tailscale/**"
+      - ".github/workflows/tailscale-policy.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: checker unit tests
+        run: python3 -m unittest -v tailscale/test_check.py
+      - name: policy structure, policy tests and allow/deny table
+        run: python3 tailscale/check.py tailscale/policy.hujson

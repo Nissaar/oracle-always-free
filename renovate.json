@@ -1,0 +1,115 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "UTC",
+  "schedule": [
+    "before 7am on monday"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "semanticCommits": "enabled",
+  "semanticCommitType": "chore",
+  "semanticCommitScope": "deps",
+  "prConcurrentLimit": 5,
+  "automerge": false,
+  "dependencyDashboard": true,
+  "customManagers": [
+    {
+      "description": "OpenTofu CLI version used in CI",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/(tofu|flux-bootstrap)\\.yml$/"
+      ],
+      "matchStrings": [
+        "TOFU_VERSION: (?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "opentofu/opentofu",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "Trivy binary used in CI",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/(tofu|flux-bootstrap)\\.yml$/"
+      ],
+      "matchStrings": [
+        "TRIVY_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "aquasecurity/trivy",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "description": "tflint binary used in CI",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/(tofu|flux-bootstrap)\\.yml$/"
+      ],
+      "matchStrings": [
+        "TFLINT_VERSION: (?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "terraform-linters/tflint",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Providers come from the OpenTofu registry (Renovate defaults to registry.terraform.io; see its terraform manager readme, 'Terraform vs OpenTofu')",
+      "matchDatasources": [
+        "terraform-provider",
+        "terraform-module"
+      ],
+      "registryUrls": [
+        "https://registry.opentofu.org"
+      ]
+    },
+    {
+      "description": "required_version is an OpenTofu constraint; Renovate would compare it with Terraform releases",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchDepTypes": [
+        "required_version"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "One PR for all provider minor and patch updates (OpenTofu registry, terraform manager); majors stay separate",
+      "matchManagers": [
+        "terraform"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "provider minor and patch updates"
+    },
+    {
+      "description": "One PR for all github actions minor and patch updates; majors stay separate",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
+      "groupName": "github actions minor and patch updates"
+    },
+    {
+      "description": "Label majors so they stand out; read the release notes before merging",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "addLabels": [
+        "major"
+      ]
+    }
+  ]
+}

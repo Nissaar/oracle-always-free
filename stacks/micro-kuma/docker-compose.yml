@@ -1,0 +1,160 @@
+# Remote Uptime Kuma stack. The same files run on Oracle's micro-kuma (location "oracle")
+# and on the GCP e2-micro (location "gcp", copy in gcp-always-free/stacks/kuma/); only .env differs.
+#
+#   tailscale     joins the tailnet as its own device (kernel mode inside its own network namespace,
+#                 host untouched) and serves the Kuma UI on https://<TS_HOSTNAME>.<tailnet>.ts.net
+#   kuma          Uptime Kuma 2, SQLite in ./data. Its checks leave through the normal Docker network,
+#                 never through the tailnet or an exit node (that would hide the location).
+#   autokuma      creates the monitors from the files sync keeps in the `monitors` volume
+#   sync          git checkout of your monitors repository (GIT_URL in .env),
+#                 copies uptime-kuma/remote-monitors/<location>/ into `monitors` every SYNC_PERIOD s,
+#                 and writes the webhook notification (alert-details Worker) from .env
+#   push          heartbeat to a push monitor of another Kuma every PUSH_PERIOD s,
+#                 only while the local Kuma answers
+#   ghcr-forward  profile ghcr-mirror, GCP only: the VM has no IPv4 and ghcr.io has no IPv6, so the
+#                 host's Docker pulls ghcr.io images from localhost:5000, forwarded over the tailnet
+#                 to the pull-through cache on micro-edge
+#
+# sync, push and ghcr-forward share the tailscale container's network namespace (tailnet routes and
+# MagicDNS). Start and update with ./up.sh (Tailscale first, then the rest).
+# Memory caps add up to about 740 MB (no swap anywhere: design choice); the VM has 1 GB.
+name: kuma
+
+services:
+  tailscale:
+    image: ${TAILSCALE_IMAGE:-tailscale/tailscale:latest}   # pin a tag in .env if you want (docs/CONFIGURATION.md)
+    container_name: kuma_tailscale
+    hostname: ${TS_HOSTNAME:?set TS_HOSTNAME in .env}
+    restart: unless-stopped
+    environment:
+      - TS_HOSTNAME=${TS_HOSTNAME:?set TS_HOSTNAME in .env}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false                  # real tailnet routes in this namespace, for sync/push/ghcr-forward
+      - TS_ACCEPT_DNS=true                  # MagicDNS names (Home node, micro-edge) resolve here
+      - TS_AUTHKEY=${TS_AUTHKEY:-}          # optional: empty = log in with the link in `docker compose logs tailscale`
+      - TS_SERVE_CONFIG=/config/serve.json  # tailnet-only HTTPS for the Kuma UI, never Funnel
+      - TS_TAILSCALED_EXTRA_ARGS=--port=41641
+      - TS_NO_LOGS_NO_SUPPORT=true          # no log upload to Tailscale: saves egress (GCP: 1 GB/month free)
+    volumes:
+      - ./state:/var/lib/tailscale
+      - ./serve.json:/config/serve.json:ro
+      - /dev/net/tun:/dev/net/tun
+    cap_add: [NET_ADMIN, NET_RAW]
+    ports:
+      - "41641:41641/udp"                   # direct WireGuard connections (else traffic goes through DERP relays)
+      - "127.0.0.1:5000:5000"               # ghcr-forward, loopback only; nothing listens unless the profile is on
+    networks:
+      kuma:
+        ipv4_address: 10.253.0.2
+    mem_limit: 128m
+    memswap_limit: 128m
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale status --json >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  kuma:
+    image: ${KUMA_IMAGE:-louislam/uptime-kuma:2}
+    container_name: kuma_app
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+      - UPTIME_KUMA_DB_TYPE=sqlite          # skip the database question on the first visit
+      - UPTIME_KUMA_WS_ORIGIN_CHECK=bypass  # the UI comes through Tailscale serve (tailnet only), which changes the Host header
+      - NODE_OPTIONS=--max-old-space-size=256
+    volumes:
+      - ./data:/app/data
+    networks:
+      kuma:
+        ipv4_address: 10.253.0.10           # fixed: serve.json and push.sh reach Kuma by address
+    mem_limit: 400m
+    memswap_limit: 400m
+
+  autokuma:
+    image: ${AUTOKUMA_IMAGE:-ghcr.io/bigboot/autokuma:2}
+    container_name: kuma_autokuma
+    restart: unless-stopped
+    depends_on: [kuma]
+    environment:
+      - TZ=UTC
+      - AUTOKUMA__KUMA__URL=http://kuma:3001
+      - AUTOKUMA__KUMA__USERNAME=${KUMA_ADMIN_USER:?set KUMA_ADMIN_USER in .env}
+      - AUTOKUMA__KUMA__PASSWORD=${KUMA_ADMIN_PASSWORD:?set KUMA_ADMIN_PASSWORD in .env}
+      - AUTOKUMA__STATIC_MONITORS=/monitors
+      - AUTOKUMA__DOCKER__ENABLED=false
+      # Same as Home: a removed file never deletes a monitor and its history; delete it in the UI.
+      - AUTOKUMA__ON_DELETE=keep
+    volumes:
+      - monitors:/monitors:ro
+    networks:
+      kuma:
+        ipv4_address: 10.253.0.11           # fixed: otherwise Docker can hand Tailscale's reserved .2 to AutoKuma at boot, and Tailscale (with sync, push and ghcr-forward) then never starts (25 Nov 2026)
+    mem_limit: 96m
+    memswap_limit: 96m
+
+  sync:
+    image: ${GIT_IMAGE:-alpine/git:latest}
+    container_name: kuma_sync
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on: [tailscale]
+    entrypoint: ["/bin/sh", "/sync.sh"]
+    environment:
+      - GIT_URL=${GIT_URL:?set GIT_URL in .env}
+      - GIT_BRANCH=${GIT_BRANCH:-main}
+      - GIT_USERNAME=${GIT_USERNAME:-}
+      - GIT_TOKEN=${GIT_TOKEN:-}
+      - MONITOR_DIR=${MONITOR_DIR:?set MONITOR_DIR in .env}
+      - SYNC_PERIOD=${SYNC_PERIOD:-600}
+      - KUMA_LOCATION=${KUMA_LOCATION:?set KUMA_LOCATION in .env}
+      - KUMA_WORKER_URL=${KUMA_WORKER_URL:-}
+      - KUMA_TOKEN=${KUMA_TOKEN:-}
+      - KUMA_NOTIFICATION_NAME=${KUMA_NOTIFICATION_NAME:-worker}
+    volumes:
+      - ./sync.sh:/sync.sh:ro
+      - repo:/repo
+      - monitors:/monitors
+    mem_limit: 64m
+    memswap_limit: 64m
+
+  push:
+    image: ${CURL_IMAGE:-curlimages/curl:latest}
+    container_name: kuma_push
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on: [tailscale]
+    entrypoint: ["/bin/sh", "/push.sh"]
+    environment:
+      - KUMA_PUSH_URL=${KUMA_PUSH_URL:-}
+      - PUSH_PERIOD=${PUSH_PERIOD:-60}
+      - KUMA_LOCAL_URL=http://10.253.0.10:3001
+    volumes:
+      - ./push.sh:/push.sh:ro
+    mem_limit: 32m
+    memswap_limit: 32m
+
+  ghcr-forward:
+    image: ${SOCAT_IMAGE:-alpine/socat:latest}
+    container_name: kuma_ghcr_forward
+    restart: unless-stopped
+    profiles: [ghcr-mirror]
+    network_mode: service:tailscale
+    depends_on: [tailscale]
+    command: ["TCP-LISTEN:5000,fork,reuseaddr", "TCP:${GHCR_MIRROR:-micro-edge:5000}"]
+    mem_limit: 32m
+    memswap_limit: 32m
+
+networks:
+  kuma:
+    enable_ipv6: true                       # the GCP VM has IPv6 only; harmless on Oracle
+    ipam:
+      config:
+        - subnet: 10.253.0.0/24
+        - subnet: fd6b:756d:6100::/64
+
+volumes:
+  repo:
+  monitors:

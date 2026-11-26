@@ -1,0 +1,330 @@
+name: tofu
+
+# PR            -> validate + tflint + trivy + plan (plan posted as a PR comment)
+# push to main  -> validate + tflint + trivy + plan (plan saved as an artifact)
+# manual run    -> apply the exact plan saved for the current main commit
+#
+# Manual apply is a workflow_dispatch because required reviewers on
+# environments are not available for private repos on the GitHub Free plan.
+# Oracle enforces the split too: PR runs can only become the read-only
+# oracle-always-free-plan user; runs on main become oracle-always-free-apply
+# (bootstrap/identity.tf). bootstrap/ is never applied by CI.
+#
+# State: s3 backend on Oracle's S3-compatible endpoint (OpenTofu has no oci
+# backend), key of user s3-tfstate from the secrets OCI_STATE_ACCESS_KEY_ID /
+# OCI_STATE_SECRET_ACCESS_KEY, written to profile oracle-tfstate by
+# scripts/tfstate-profile.sh. Oracle honours the S3 lock file (use_lockfile,
+# seen working on 2026-11-06); the concurrency group below is a second guard:
+# never cancel or bypass it.
+#
+# Security notes for whoever owns a copy of this repository:
+#   - Run it in a PRIVATE repository. The saved plan (artifact tfplan-<sha>, 7 days) is a binary file that can hold
+#     values the provider marks sensitive, and a pull-request comment shows the plan text: both are readable by
+#     everybody who can read the repository.
+#   - Anyone with WRITE access can edit this file in a branch and run it with the read-only identity; only main can become
+#     the apply identity (bootstrap/identity.tf). Protect main and give write access to nobody you do not trust (README).
+#   - Fork pull requests get no secrets, no OIDC token and no plan job (the `if:` of the plan job).
+
+on:
+  pull_request:
+    paths:
+      - "bootstrap/**"
+      - "infra/**"
+      - "scripts/oci-login.sh"
+      - "scripts/tfstate-profile.sh"
+      - "patch/**"
+      - "stacks/**"
+      - ".tflint.hcl"
+      - ".github/workflows/tofu.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bootstrap/**"
+      - "infra/**"
+      - "scripts/oci-login.sh"
+      - "scripts/tfstate-profile.sh"
+      - "patch/**"
+      - "stacks/**"
+      - ".tflint.hcl"
+      - ".github/workflows/tofu.yml"
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "apply" to apply the plan saved for the latest main commit'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One state-touching run at a time on main; PRs queue per branch.
+  group: tofu-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: false
+
+env:
+  TOFU_VERSION: 1.13.9
+  TRIVY_VERSION: v0.76.2
+  TFLINT_VERSION: v0.66.0
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_VAR_tenancy_ocid: ${{ vars.OCI_TENANCY_OCID }}
+  TF_VAR_region: ${{ vars.OCI_REGION }}
+  TF_VAR_compartment_ocid: ${{ vars.OCI_COMPARTMENT_OCID }}
+  TF_VAR_micro_ssh_public_key: ${{ vars.MICRO_SSH_PUBLIC_KEY }}
+  OCI_TENANCY_OCID: ${{ vars.OCI_TENANCY_OCID }}
+  OCI_REGION: ${{ vars.OCI_REGION }}
+  OCI_OIDC_DOMAIN_URL: ${{ vars.OCI_OIDC_DOMAIN_URL }}
+  OCI_OIDC_CLIENT_ID: ${{ vars.OCI_OIDC_CLIENT_ID }}
+
+jobs:
+  validate:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the job never pushes: no token left in .git/config
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: tofu fmt
+        run: tofu fmt -check -recursive -diff
+
+      - name: tofu validate
+        run: |
+          for dir in bootstrap infra; do
+            echo "::group::$dir"
+            tofu -chdir="$dir" init -backend=false -lockfile=readonly
+            tofu -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when downloading the plugin
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+  # The patch agent is embedded in the micros' cloud-init (infra/micros.tf) and the node-image script is what proposes node images: their tests run before a plan.
+  patch-tests:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the job never pushes: no token left in .git/config
+      - name: shellcheck the scripts
+        run: |
+          shellcheck patch/*.sh scripts/*.sh stacks/*/*.sh
+          shellcheck -S warning stacks/*/*/*.sh
+      - name: patch agent tests (fake apt / docker / systemctl, no network)
+        run: cd patch && python3 -m unittest -v test_patch_agent
+      - name: node-image script tests (fake oci)
+        run: python3 -m unittest -v scripts/test_node_image_bump.py
+
+  trivy:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the job never pushes: no token left in .git/config
+      # Pinned by commit: trivy-action tags were hijacked in March 2026 (CVE-2026-33634).
+      - name: trivy config scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: config
+          scan-ref: .
+          severity: MEDIUM,HIGH,CRITICAL
+          exit-code: "1"
+          hide-progress: true
+
+  plan:
+    needs: [validate, trivy, patch-tests]
+    # Fork pull requests never reach a cloud login: this job (the only one with credentials on a pull request)
+    # is skipped for them, and in a repository that is not configured yet (no OCI_TENANCY_OCID variable).
+    if: vars.OCI_TENANCY_OCID != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the job never pushes: no token left in .git/config
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      - name: Oracle login (GitHub OIDC -> session token)
+        env:
+          OCI_OIDC_CLIENT_SECRET: ${{ secrets.OCI_OIDC_CLIENT_SECRET }}
+        run: ./scripts/oci-login.sh
+      - name: State bucket key (profile oracle-tfstate)
+        env:
+          OCI_STATE_ACCESS_KEY_ID: ${{ secrets.OCI_STATE_ACCESS_KEY_ID }}
+          OCI_STATE_SECRET_ACCESS_KEY: ${{ secrets.OCI_STATE_SECRET_ACCESS_KEY }}
+        run: ./scripts/tfstate-profile.sh
+
+      - name: tofu init
+        run: tofu -chdir=infra init -lockfile=readonly
+
+      - name: tofu plan
+        id: plan
+        run: |
+          set +e
+          tofu -chdir=infra plan -lock-timeout=5m -detailed-exitcode -out=tfplan
+          code=$?
+          set -e
+          [ "$code" -eq 1 ] && exit 1
+          echo "changes=$([ "$code" -eq 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          tofu -chdir=infra show -no-color tfplan > plan.txt
+          {
+            echo "## OpenTofu plan"
+            echo '```'
+            grep -E '^(Plan:|No changes\.)' plan.txt || true
+            echo '```'
+            echo '<details><summary>Full plan</summary>'
+            echo
+            echo '```hcl'
+            head -c 60000 plan.txt
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- tofu-plan -->';
+            const plan = fs.readFileSync('plan.txt', 'utf8');
+            const summary = (plan.match(/^(Plan:.*|No changes\..*)$/m) || ['(see run)'])[0];
+            const body = [
+              marker,
+              `### OpenTofu plan: ${summary}`,
+              `Commit ${context.sha.slice(0, 7)}, [run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              '<details><summary>Full plan</summary>',
+              '',
+              '```hcl',
+              plan.slice(0, 60000),
+              '```',
+              '</details>',
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const old = comments.find(c => c.body.includes(marker));
+            if (old) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: old.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Save plan for manual apply
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tfplan-${{ github.sha }}
+          path: |
+            infra/tfplan
+            plan.txt
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true # a re-run of the same commit replaces its plan
+
+  apply:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    steps:
+      - name: Check request
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Apply only runs from main (got $GITHUB_REF)"; exit 1
+          fi
+          if [ "$CONFIRM" != "apply" ]; then
+            echo '::error::Type "apply" in the confirm box to apply'; exit 1
+          fi
+
+      - name: Find the plan run for this commit
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tofu.yml \
+            --branch main --event push --commit "$GITHUB_SHA" --status success \
+            --json databaseId --jq '.[0].databaseId')
+          if [ -z "$run_id" ]; then
+            echo "::error::No successful plan for $GITHUB_SHA. Push to main (or re-run its workflow) first, wait for it to pass, then apply."
+            exit 1
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Applying plan from run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run_id" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # the job never pushes: no token left in .git/config
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan-${{ github.sha }}
+          run-id: ${{ steps.find.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: .
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+      - name: Oracle login (GitHub OIDC -> session token)
+        env:
+          OCI_OIDC_CLIENT_SECRET: ${{ secrets.OCI_OIDC_CLIENT_SECRET }}
+        run: ./scripts/oci-login.sh
+      - name: State bucket key (profile oracle-tfstate)
+        env:
+          OCI_STATE_ACCESS_KEY_ID: ${{ secrets.OCI_STATE_ACCESS_KEY_ID }}
+          OCI_STATE_SECRET_ACCESS_KEY: ${{ secrets.OCI_STATE_SECRET_ACCESS_KEY }}
+        run: ./scripts/tfstate-profile.sh
+
+      - name: tofu init
+        run: tofu -chdir=infra init -lockfile=readonly
+
+      # OpenTofu refuses a saved plan if the state changed after it was made.
+      - name: tofu apply
+        run: |
+          {
+            echo "## Applied plan"
+            echo '```'
+            grep -E '^(Plan:|No changes\.)' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          tofu -chdir=infra apply -lock-timeout=5m tfplan
+
+      - name: Outputs
+        run: |
+          {
+            echo "## Outputs"
+            echo '```'
+            tofu -chdir=infra output
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

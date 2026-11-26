@@ -1,0 +1,86 @@
+name: node-image
+
+# Proposes the OKE worker-node image as a PULL REQUEST (infra/node-image.auto.tfvars). Nodes are never patched in place:
+# a newer image only reaches the cluster when you merge that PR and run the tofu apply, which replaces the nodes one at a
+# time (docs/NODE-IMAGE.md). Every Monday 02:00 UTC, or by hand: Actions -> node-image -> Run workflow.
+#   first run  (no pin file)  -> PR "pin the node image to the one the pool runs now": changes nothing in the cluster
+#   later runs                -> PR "OKE node image <name>" when Oracle publishes a newer aarch64 image for the cluster's Kubernetes version
+# Oracle side: read-only calls (cluster, node pool and node-pool-options lists). On main the OIDC login becomes the apply user
+# (bootstrap/identity.tf maps the sub claim, not the event), so this workflow must stay read-only: scripts/node-image-bump.sh
+# has a test that lists the only three calls it makes.
+# New secret (name only, optional): NODE_IMAGE_PR_TOKEN = a fine-grained token with Contents and Pull requests: read and write on this
+# repo. Without it the PR is opened with the default token, and GitHub does not start the tofu plan for such a PR: close and
+# reopen the PR once and the plan runs.
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: node-image
+  cancel-in-progress: false
+
+env:
+  OCI_CLI_VERSION: 3.97.1 # keep equal to flux-bootstrap.yml
+  OCI_TENANCY_OCID: ${{ vars.OCI_TENANCY_OCID }}
+  OCI_REGION: ${{ vars.OCI_REGION }}
+  OCI_OIDC_DOMAIN_URL: ${{ vars.OCI_OIDC_DOMAIN_URL }}
+  OCI_OIDC_CLIENT_ID: ${{ vars.OCI_OIDC_CLIENT_ID }}
+  OCI_COMPARTMENT_OCID: ${{ vars.OCI_COMPARTMENT_OCID }}
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.ref == 'refs/heads/main' && vars.OCI_TENANCY_OCID != ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Script tests (fake oci)
+        run: python3 -m unittest scripts/test_node_image_bump.py
+      - name: OCI CLI (pinned)
+        run: pip install --quiet "oci-cli==$OCI_CLI_VERSION"
+      - name: Oracle login (GitHub OIDC -> session token)
+        env:
+          OCI_OIDC_CLIENT_SECRET: ${{ secrets.OCI_OIDC_CLIENT_SECRET }}
+        run: ./scripts/oci-login.sh
+      - name: Compare with what Oracle offers
+        id: bump
+        env:
+          OCI_CLI_PROFILE: CI                 # the profile scripts/oci-login.sh writes (session token, not an API key)
+          OCI_CLI_AUTH: security_token
+        run: ./scripts/node-image-bump.sh
+      - name: Pull request
+        if: steps.bump.outputs.result != 'none'
+        env:
+          GH_TOKEN: ${{ secrets.NODE_IMAGE_PR_TOKEN || github.token }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+          TITLE: ${{ steps.bump.outputs.title }}
+          RESULT: ${{ steps.bump.outputs.result }}
+          IMAGE: ${{ steps.bump.outputs.image }}
+          PREVIOUS: ${{ steps.bump.outputs.previous }}
+        run: |
+          if [ "$(gh pr list --state open --json headRefName --jq '[.[] | select(.headRefName | startswith("node-image/"))] | length')" != 0 ]; then
+            echo "a node-image pull request is already open: nothing to add" >> "$GITHUB_STEP_SUMMARY"; exit 0
+          fi
+          git config user.name "node-image workflow"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add infra/node-image.auto.tfvars
+          git commit -m "$TITLE"
+          git push origin "$BRANCH"
+          if [ "$RESULT" = pin ]; then
+            printf '%s\n' "Freezes the node image to the one the pool runs now ($IMAGE). Changes nothing in the cluster: the plan must show no change to the node pool." \
+              "From now on a newer Oracle image does nothing until a pull request like this one is merged." > body.md
+          else
+            printf '%s\n' "Oracle offers a newer node image: $PREVIOUS -> $IMAGE." \
+              "Merging and applying replaces the 2 worker nodes one at a time (cordon, drain, new node, wait Ready). Read docs/NODE-IMAGE.md first:" \
+              "single-replica apps restart once (about 1-3 minutes each), Traefik and cloudflared stay up." \
+              "Check the plan comment below shows only the node pool being replaced, then merge, then apply in a quiet hour." > body.md
+          fi
+          gh pr create --base main --head "$BRANCH" --title "$TITLE" --body-file body.md

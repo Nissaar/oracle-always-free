@@ -1,0 +1,24 @@
+name: Feature or documentation request
+description: Suggest an improvement, a recipe or a clearer README step
+labels: [enhancement]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: What would you like to change or add?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why, and does it stay inside the free tier?
+      description: Say what it costs, or how a quota or budget keeps it free.
+    validations:
+      required: true
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Checks
+      options:
+        - label: This request contains no identifiers, e-mail addresses, tokens or keys
+          required: true

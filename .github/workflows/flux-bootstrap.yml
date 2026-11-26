@@ -1,0 +1,179 @@
+name: flux-bootstrap
+
+# One-off (and disaster recovery): install the Flux Operator into the cluster
+# and point it at the k8s-free-gitops repo. After this, Flux manages itself from git.
+#
+# The Kubernetes API is private. This run opens a short OCI Bastion
+# port-forwarding session to it, uses it, and lets it expire.
+# Re-running is safe: every step is an install-or-update.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "bootstrap" to install or repair Flux in oke-free'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: tofu-main
+  cancel-in-progress: false
+
+env:
+  TOFU_VERSION: 1.13.9
+  # owner/name of YOUR copy of k8s-free-gitops: the repository variable CLUSTER_REPO (scripts/bootstrap.sh sets it when
+  # you pass CLUSTER_REPO=owner/name; otherwise: gh variable set CLUSTER_REPO --body owner/name).
+  CLUSTER_REPO: ${{ vars.CLUSTER_REPO }}
+  # Pinned: change on purpose (docs/CONFIGURATION.md). The operator chart is pulled from ghcr.io/controlplaneio-fluxcd.
+  FLUX_OPERATOR_CHART_VERSION: 0.63.1
+  OCI_CLI_VERSION: 3.97.1
+  OCI_TENANCY_OCID: ${{ vars.OCI_TENANCY_OCID }}
+  OCI_REGION: ${{ vars.OCI_REGION }}
+  OCI_OIDC_DOMAIN_URL: ${{ vars.OCI_OIDC_DOMAIN_URL }}
+  OCI_OIDC_CLIENT_ID: ${{ vars.OCI_OIDC_CLIENT_ID }}
+  OCI_COMPARTMENT_OCID: ${{ vars.OCI_COMPARTMENT_OCID }}
+  OCI_VAULT_OCID: ${{ vars.OCI_VAULT_OCID }}
+
+jobs:
+  bootstrap:
+    # Only in a configured copy (scripts/bootstrap.sh sets this variable), never in the unconfigured template.
+    if: vars.OCI_TENANCY_OCID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check request
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "::error::Only from main"; exit 1; }
+          [ "$CONFIRM" = "bootstrap" ] || { echo '::error::Type "bootstrap" to run'; exit 1; }
+          case "$CLUSTER_REPO" in
+            */* ) ;;
+            * ) echo '::error::Set the repository variable CLUSTER_REPO to owner/name of your k8s-free-gitops copy'; exit 1 ;;
+          esac
+          if [[ ! "$CLUSTER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo '::error::CLUSTER_REPO must look like owner/name'; exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Oracle login (GitHub OIDC -> session token)
+        env:
+          OCI_OIDC_CLIENT_SECRET: ${{ secrets.OCI_OIDC_CLIENT_SECRET }}
+        run: ./scripts/oci-login.sh
+      - name: State bucket key (profile oracle-tfstate)
+        env:
+          OCI_STATE_ACCESS_KEY_ID: ${{ secrets.OCI_STATE_ACCESS_KEY_ID }}
+          OCI_STATE_SECRET_ACCESS_KEY: ${{ secrets.OCI_STATE_SECRET_ACCESS_KEY }}
+        run: ./scripts/tfstate-profile.sh
+
+      - name: Install the OCI CLI
+        run: |
+          python3 -m venv "$RUNNER_TEMP/oci"
+          "$RUNNER_TEMP/oci/bin/pip" install --quiet "oci-cli==$OCI_CLI_VERSION"
+          echo "$RUNNER_TEMP/oci/bin" >> "$GITHUB_PATH"
+
+      - name: Read cluster facts from the OpenTofu state
+        id: tf
+        run: |
+          tofu -chdir=infra init -input=false -lockfile=readonly >/dev/null
+          {
+            echo "cluster_id=$(tofu -chdir=infra output -raw cluster_id)"
+            echo "bastion_id=$(tofu -chdir=infra output -raw bastion_id)"
+            echo "api=$(tofu -chdir=infra output -raw api_private_endpoint)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open a Bastion tunnel to the private API
+        env:
+          BASTION_ID: ${{ steps.tf.outputs.bastion_id }}
+          API: ${{ steps.tf.outputs.api }}
+        run: |
+          oci_() { oci --auth security_token --profile CI "$@"; }
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/bastion"
+          api_ip=${API%:*}
+          session=$(oci_ bastion session create-port-forwarding \
+            --bastion-id "$BASTION_ID" --display-name "flux-bootstrap-$GITHUB_RUN_ID" \
+            --ssh-public-key-file "$RUNNER_TEMP/bastion.pub" \
+            --target-private-ip "$api_ip" --target-port 6443 \
+            --session-ttl 1800 --wait-for-state SUCCEEDED --query 'data.resources[0].identifier' --raw-output)
+          echo "api_ip=$api_ip" >> "$GITHUB_ENV"
+          ssh -i "$RUNNER_TEMP/bastion" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 \
+            -N -f -L 6443:"$api_ip":6443 -p 22 \
+            "$session@host.bastion.$OCI_REGION.oci.oraclecloud.com"
+          for _ in $(seq 30); do nc -z 127.0.0.1 6443 && break; sleep 2; done
+          nc -z 127.0.0.1 6443
+
+      - name: kubeconfig through the tunnel
+        env:
+          CLUSTER_ID: ${{ steps.tf.outputs.cluster_id }}
+        run: |
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          oci --auth security_token --profile CI ce cluster create-kubeconfig \
+            --cluster-id "$CLUSTER_ID" --file "$KUBECONFIG" --region "$OCI_REGION" \
+            --token-version 2.0.0 --kube-endpoint PRIVATE_ENDPOINT
+          ctx_cluster=$(kubectl config view -o jsonpath='{.clusters[0].name}')
+          # Same certificate, reached at 127.0.0.1: tell kubectl which name to expect.
+          kubectl config set-cluster "$ctx_cluster" --server=https://127.0.0.1:6443 --tls-server-name="$api_ip"
+          # The token plugin must use this job's session token. --exec-arg REPLACES the whole argument
+          # list (it does not append), so give the full list: with only the auth flags `oci` prints its
+          # help text and kubectl fails with "decoding stdout: yaml: ... mapping values are not allowed".
+          user=$(kubectl config view -o jsonpath='{.users[0].name}')
+          kubectl config set-credentials "$user" \
+            --exec-arg=ce --exec-arg=cluster --exec-arg=generate-token \
+            --exec-arg=--cluster-id --exec-arg="$CLUSTER_ID" --exec-arg=--region --exec-arg="$OCI_REGION" \
+            --exec-arg=--auth --exec-arg=security_token --exec-arg=--profile --exec-arg=CI
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          kubectl get nodes -o wide
+
+      - name: Secrets from OCI Vault -> flux-system
+        run: |
+          get() {
+            local id
+            id=$(oci --auth security_token --profile CI vault secret list --compartment-id "$OCI_COMPARTMENT_OCID" \
+                   --vault-id "$OCI_VAULT_OCID" --name "$1" --lifecycle-state ACTIVE --query 'data[0].id' --raw-output)
+            oci --auth security_token --profile CI secrets secret-bundle get --secret-id "$id" \
+              --query 'data."secret-bundle-content".content' --raw-output | base64 -d > "$2"
+          }
+          umask 077
+          get flux-deploy-key "$RUNNER_TEMP/identity"
+          get sops-age-key "$RUNNER_TEMP/age.agekey"
+          ssh-keygen -y -f "$RUNNER_TEMP/identity" > "$RUNNER_TEMP/identity.pub"
+          # GitHub's SSH host keys from its API over TLS (not trust-on-first-use through ssh-keyscan).
+          curl -fsS --proto '=https' https://api.github.com/meta | jq -er '.ssh_keys[] | "github.com " + .' > "$RUNNER_TEMP/known_hosts"
+          kubectl create namespace flux-system --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n flux-system create secret generic flux-git-auth \
+            --from-file=identity="$RUNNER_TEMP/identity" \
+            --from-file=identity.pub="$RUNNER_TEMP/identity.pub" \
+            --from-file=known_hosts="$RUNNER_TEMP/known_hosts" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n flux-system create secret generic sops-age \
+            --from-file=age.agekey="$RUNNER_TEMP/age.agekey" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          cp "$RUNNER_TEMP/identity" "$RUNNER_TEMP/git-key"
+
+      - name: Install the Flux Operator
+        run: |
+          helm upgrade --install flux-operator oci://ghcr.io/controlplaneio-fluxcd/charts/flux-operator \
+            --version "$FLUX_OPERATOR_CHART_VERSION" --namespace flux-system --wait --timeout 10m
+
+      - name: Apply the FluxInstance from the k8s-free-gitops repo
+        run: |
+          GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/git-key -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts" \
+            git clone --depth 1 "git@github.com:$CLUSTER_REPO.git" "$RUNNER_TEMP/cluster"
+          kubectl apply -f "$RUNNER_TEMP/cluster/clusters/oke/flux-instance.yaml"
+          kubectl -n flux-system wait fluxinstance/flux --for=condition=Ready --timeout=10m
+          kubectl -n flux-system get fluxinstance,kustomizations.kustomize.toolkit.fluxcd.io
+
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RUNNER_TEMP"/identity* "$RUNNER_TEMP"/git-key "$RUNNER_TEMP"/age.agekey "$RUNNER_TEMP"/cluster

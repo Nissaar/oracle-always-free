@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""patch-agent: OS patching bookkeeping for one machine (Debian / Ubuntu). Python 3 standard library only.
+
+The patching itself is done by apt's own unattended-upgrades (security updates, daily, NO automatic reboot).
+This agent adds what unattended-upgrades does not do:
+
+  status [--json]   what is pending, when it last ran, whether a reboot is waiting
+  report            status -> the status feed (ntfy topic), heartbeat to Kuma, reminders and failure alerts
+  reboot-if-needed  reboot only when /var/run/reboot-required exists: on this machine's night (mode staggered)
+                    or when you approved it (`reboot <machine>` in ChatOps)
+  reboot-now        reboot unconditionally and remember it was planned (ChatOps `reboot` on the Home server uses this)
+  approve-poll      look for a reboot approval for this machine on the feed (every 10 min)
+  postboot          after every boot: are Docker, Tailscale, the containers and the push heartbeat back? if not: alert
+  check-restart     list running containers that have no restart policy (always / unless-stopped)
+  install           apply-patching.sh does this; see there
+
+Copies: this file is identical in <home-server-repo>/ops/patch, gcp-always-free/patch and oracle-always-free/patch
+(version below). Change all three; `sha256sum patch-agent` must match.
+
+Settings: /etc/patch-agent.conf (no secrets, written by apply-patching.sh, safe to overwrite) and
+/etc/patch-agent.env (secrets, by hand, mode 600: PATCH_NTFY_URL, PATCH_ALERT_URL, PATCH_HEARTBEAT_URL).
+PATCH_ROOT (tests only) puts every path under another directory.
+"""
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+VERSION = 1
+DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+SAFE = re.compile(r'[^A-Za-z0-9._@:/ -]')
+
+
+def P(path):
+    return os.environ.get('PATCH_ROOT', '') + path
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def iso(ts):
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def sh(argv, timeout=120):
+    """Run a fixed argv (never a shell) -> (returncode, output). 127 when the program is missing."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env={**os.environ, 'LC_ALL': 'C', 'DEBIAN_FRONTEND': 'noninteractive'})
+    except FileNotFoundError:
+        return 127, f'{argv[0]}: not installed'
+    except subprocess.TimeoutExpired:
+        return 124, f'{argv[0]}: timed out after {timeout}s'
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
+def read_kv(path):
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def conf():
+    c = {'PATCH_HOST': os.uname().nodename, 'PATCH_REBOOT_MODE': 'alert', 'PATCH_REBOOT_DAY': 'mon', 'PATCH_REBOOT_TIME': '00:00', 'PATCH_KUMA': 'no',
+         'PATCH_CONTAINERS': '', 'PATCH_TS_CONTAINER': '', 'PATCH_PUSH_CONTAINER': '', 'PATCH_POLL_APPROVALS': 'yes', 'PATCH_INSTALLER': 'unattended', 'PATCH_REMIND_DAYS': '3',
+         'PATCH_POSTBOOT_GRACE': '90', 'PATCH_POSTBOOT_WAIT': '600', 'PATCH_RESTART_EXEMPT': '',
+         'PATCH_NTFY_URL': '', 'PATCH_ALERT_URL': '', 'PATCH_HEARTBEAT_URL': ''}
+    c.update(read_kv(P('/etc/patch-agent.conf')))
+    c.update(read_kv(P('/etc/patch-agent.env')))
+    c.update({k: v for k, v in os.environ.items() if k.startswith('PATCH_') and k != 'PATCH_ROOT'})
+    if c['PATCH_REBOOT_MODE'] not in ('alert', 'staggered', 'none'):
+        c['PATCH_REBOOT_MODE'] = 'alert'
+    if c['PATCH_INSTALLER'] not in ('unattended', 'osconfig'):
+        c['PATCH_INSTALLER'] = 'unattended'
+    c['PATCH_REBOOT_DAY'] = c['PATCH_REBOOT_DAY'].lower()[:3]
+    return c
+
+
+def num(v, d):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return d
+
+
+def state_dir():
+    d = P('/var/lib/patch-agent')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def stamp_read(name):
+    try:
+        with open(os.path.join(state_dir(), name)) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def stamp_write(name, text):
+    try:
+        with open(os.path.join(state_dir(), name), 'w') as f:
+            f.write(text)
+    except OSError as e:
+        print(f'patch-agent: cannot write {name}: {e}', file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------------------------------- status
+def apt_pending():
+    """-> (pending packages, of which security). Uses the package lists as they are: apt-daily refreshes them."""
+    rc, out = sh(['apt-get', '-s', '-o', 'Debug::NoLocking=1', 'upgrade'], timeout=120)
+    inst = [l for l in out.splitlines() if l.startswith('Inst ')]
+    sec = [l for l in inst if re.search(r'-security|Debian-Security|ESM|esm', l)]
+    return len(inst), len(sec)
+
+
+def uu_last():
+    """-> (last run iso or None, 'ok' | 'failed' | 'unknown') from unattended-upgrades' own stamp and log."""
+    last = None
+    for p in ('/var/lib/apt/periodic/unattended-upgrades-stamp', '/var/log/unattended-upgrades/unattended-upgrades.log'):
+        try:
+            last = iso(os.path.getmtime(P(p)))
+            break
+        except OSError:
+            continue
+    result = 'unknown'
+    try:
+        with open(P('/var/log/unattended-upgrades/unattended-upgrades.log'), errors='replace') as f:
+            tail = f.read()[-60000:].splitlines()
+        for line in reversed(tail):
+            if re.search(r'ERROR|Installing the upgrades failed|dpkg returned an error|An error occurred', line):
+                result = 'failed'
+                break
+            if re.search(r'All upgrades installed|Packages that were upgraded|No packages found that can be upgraded unattended', line):
+                result = 'ok'
+                break
+    except OSError:
+        pass
+    return last, result
+
+
+def apt_history_last():
+    """-> (last run iso or None, 'ok' | 'failed' | 'unknown') from apt's own history, for machines where Google VM Manager installs the updates
+    (it runs apt-get itself, so there is no unattended-upgrades log). Looks at the newest block that upgraded something."""
+    try:
+        with open(P('/var/log/apt/history.log'), errors='replace') as f:
+            blocks = f.read()[-400000:].split('\n\n')
+    except OSError:
+        return None, 'unknown'
+    for b in reversed(blocks):
+        if not re.search(r'^(Upgrade|Install):', b, re.M):
+            continue
+        m = re.search(r'^End-Date:\s*(\d{4}-\d\d-\d\d)\s+(\d\d:\d\d:\d\d)', b, re.M) or re.search(r'^Start-Date:\s*(\d{4}-\d\d-\d\d)\s+(\d\d:\d\d:\d\d)', b, re.M)
+        if not m:
+            continue
+        try:
+            when = iso(time.mktime(time.strptime(m.group(1) + ' ' + m.group(2), '%Y-%m-%d %H:%M:%S')))
+        except ValueError:
+            continue
+        return when, ('failed' if re.search(r'^Error:', b, re.M) else 'ok')
+    return None, 'unknown'
+
+
+def no_restart_policy(c):
+    """Running containers without restart: always / unless-stopped (they would not come back after a reboot)."""
+    rc, out = sh(['docker', 'ps', '--format', '{{.Names}}'], timeout=30)
+    if rc != 0:
+        return None
+    names = [n for n in out.split() if n]
+    if not names:
+        return []
+    rc, out = sh(['docker', 'inspect', '-f', '{{.Name}} {{.HostConfig.RestartPolicy.Name}}'] + names, timeout=30)
+    if rc != 0:
+        return None
+    exempt = set(c['PATCH_RESTART_EXEMPT'].split())
+    bad = []
+    for line in out.splitlines():
+        parts = line.split()
+        name = parts[0].lstrip('/') if parts else ''
+        pol = parts[1] if len(parts) > 1 else ''
+        if name and pol not in ('always', 'unless-stopped') and name not in exempt:
+            bad.append(name)
+    return sorted(bad)
+
+
+def status(c=None):
+    c = c or conf()
+    pending, security = apt_pending()
+    last, result = apt_history_last() if c['PATCH_INSTALLER'] == 'osconfig' else uu_last()
+    rr = P('/var/run/reboot-required')
+    reboot = os.path.exists(rr)
+    pkgs = []
+    if reboot:
+        try:
+            with open(rr + '.pkgs') as f:
+                pkgs = [l.strip() for l in f if l.strip()][:5]
+        except OSError:
+            pass
+    since = None
+    if reboot:
+        try:
+            since = iso(os.path.getmtime(rr))
+        except OSError:
+            pass
+    try:
+        with open(P('/proc/uptime')) as f:
+            up_h = round(float(f.read().split()[0]) / 3600, 1)
+    except (OSError, ValueError, IndexError):
+        up_h = None
+    nr = no_restart_policy(c)
+    return {'v': VERSION, 'event': 'status', 'host': c['PATCH_HOST'], 'ts': iso(time.time()), 'mode': c['PATCH_REBOOT_MODE'], 'day': c['PATCH_REBOOT_DAY'],
+            'time': c['PATCH_REBOOT_TIME'], 'kuma': c['PATCH_KUMA'] == 'yes', 'last_run': last, 'last_result': result, 'pending': pending, 'security': security,
+            'reboot': reboot, 'reboot_since': since, 'reboot_pkgs': pkgs, 'uptime_h': up_h, 'no_restart': nr}
+
+
+# ---------------------------------------------------------------------------------------------------- messages out
+def post(url, body, title, priority, tags, timeout=20):
+    """One ntfy publish. Titles and tags are plain ASCII (HTTP headers)."""
+    if not url:
+        return False
+    req = urllib.request.Request(url, data=body.encode(), method='POST', headers={'Title': SAFE.sub('', title)[:100], 'Priority': str(priority), 'Tags': tags, 'User-Agent': 'patch-agent/1'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f'patch-agent: could not publish to the feed: {e}', file=sys.stderr)
+        return False
+
+
+def alert(c, text, priority=4, tags='warning'):
+    url = c['PATCH_ALERT_URL'] or c['PATCH_NTFY_URL']
+    if not post(url, text, f"[patch] {c['PATCH_HOST']}", priority, tags):
+        print('patch-agent: ALERT (not delivered: set PATCH_ALERT_URL in /etc/patch-agent.env):', text, file=sys.stderr)
+
+
+def feed(c, doc, priority=1):
+    return post(c['PATCH_NTFY_URL'], json.dumps(doc, separators=(',', ':')), f"patchstatus {c['PATCH_HOST']}", priority, 'patchstatus')
+
+
+def heartbeat(c, ok, msg):
+    url = c['PATCH_HEARTBEAT_URL']
+    if not url:
+        return None
+    sep = '&' if '?' in url else '?'
+    full = f"{url}{sep}status={'up' if ok else 'down'}&msg={urllib.request.quote(msg[:80])}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(full, headers={'User-Agent': 'patch-agent/1'}), timeout=20):
+            return True
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f'patch-agent: heartbeat not delivered: {str(e)[:100]}', file=sys.stderr)
+        return False
+
+
+def reminder_due(name, days):
+    try:
+        # one hour of slack: the daily report starts up to 15 minutes later or earlier than yesterday's, and "every 3 days" must not turn into 4
+        return time.time() - os.path.getmtime(os.path.join(state_dir(), name)) >= days * 86400 - 3600
+    except OSError:
+        return True
+
+
+# ---------------------------------------------------------------------------------------------------- commands
+def cmd_status(args):
+    s = status()
+    if '--json' in args:
+        print(json.dumps(s, indent=1))
+        return 0
+    print(f"{s['host']}: {s['pending']} package(s) pending ({s['security']} security), last run {s['last_run'] or 'never'} ({s['last_result']}), reboot " + ('WAITING since ' + str(s['reboot_since']) if s['reboot'] else 'not needed'))
+    return 0
+
+
+def cmd_report(args):
+    c = conf()
+    s = status(c)
+    problems = []
+    if s['last_result'] == 'failed':
+        where = '/var/log/apt/history.log and `gcloud compute os-config patch-jobs list`' if c['PATCH_INSTALLER'] == 'osconfig' else '/var/log/unattended-upgrades/unattended-upgrades.log'
+        problems.append(f'the last automatic update run FAILED: see {where}')
+        if reminder_due('alerted-failed', 1):
+            alert(c, f"{c['PATCH_HOST']}: the last automatic update run failed. See {where}", 4, 'warning')
+            stamp_write('alerted-failed', iso(time.time()))
+    if s['no_restart']:
+        problems.append('containers without a restart policy: ' + ', '.join(s['no_restart']))
+    if s['reboot']:
+        days = (time.time() - os.path.getmtime(P('/var/run/reboot-required'))) / 86400
+        remind = num(c['PATCH_REMIND_DAYS'], 3)
+        if c['PATCH_REBOOT_MODE'] == 'alert' and reminder_due('reminded-reboot', remind):
+            alert(c, f"{c['PATCH_HOST']}: a reboot is waiting since {s['reboot_since']} ({', '.join(s['reboot_pkgs']) or 'kernel / libraries'}). Send `reboot {c['PATCH_HOST']} <code>` in ChatOps when it suits you.", 3, 'repeat')
+            stamp_write('reminded-reboot', iso(time.time()))
+        elif c['PATCH_REBOOT_MODE'] == 'staggered' and days > 8:
+            alert(c, f"{c['PATCH_HOST']}: reboot waiting for {days:.0f} days although mode is staggered ({c['PATCH_REBOOT_DAY']} {c['PATCH_REBOOT_TIME']} UTC): the reboot job is not running.", 4, 'warning')
+        elif c['PATCH_REBOOT_MODE'] == 'none' and days > 30:
+            alert(c, f"{c['PATCH_HOST']}: reboot waiting for {days:.0f} days (mode none).", 3, 'warning')
+    if not s['reboot']:
+        try:
+            os.remove(os.path.join(state_dir(), 'reminded-reboot'))     # the next reboot that is needed alerts at once, not after what is left of the old interval
+        except OSError:
+            pass
+    s['problems'] = problems
+    delivered = feed(c, s)
+    ok = s['last_result'] != 'failed'
+    heartbeat(c, ok, f"pending {s['pending']} reboot {'yes' if s['reboot'] else 'no'} {s['last_result']}")
+    print(json.dumps({k: s[k] for k in ('host', 'pending', 'reboot', 'last_result')}), 'feed' if delivered else 'feed-not-delivered')
+    return 0
+
+
+def preflight(c):
+    """Warnings only: a container without a restart policy would stay down after the reboot."""
+    bad = no_restart_policy(c)
+    if bad:
+        alert(c, f"{c['PATCH_HOST']}: about to reboot, but these containers have no restart policy and will NOT come back: {', '.join(bad)}", 4, 'warning')
+    return bad or []
+
+
+def do_reboot(c, why):
+    stamp_write('expect-reboot', json.dumps({'ts': iso(time.time()), 'why': why}))
+    feed(c, {'v': VERSION, 'event': 'rebooting', 'host': c['PATCH_HOST'], 'ts': iso(time.time()), 'why': why, 'kuma': c['PATCH_KUMA'] == 'yes'}, 2)
+    rc, out = sh(['systemctl', 'reboot'], timeout=60)
+    if rc != 0:
+        alert(c, f"{c['PATCH_HOST']}: reboot command failed: {out[:120]}", 4, 'warning')
+    return rc
+
+
+def cmd_reboot_if_needed(args):
+    c = conf()
+    approved = '--approved' in args
+    if not approved:
+        if c['PATCH_REBOOT_MODE'] != 'staggered':
+            print('mode is not staggered: no automatic reboot')
+            return 0
+        if DAYS[now().weekday()] != c['PATCH_REBOOT_DAY'] and '--any-day' not in args:
+            print(f"not this machine's night ({c['PATCH_REBOOT_DAY']})")
+            return 0
+    if not os.path.exists(P('/var/run/reboot-required')):
+        print('no reboot needed')
+        if approved:
+            feed(c, {'v': VERSION, 'event': 'noreboot', 'host': c['PATCH_HOST'], 'ts': iso(time.time())}, 2)
+        return 0
+    preflight(c)
+    return do_reboot(c, 'approved in ChatOps' if approved else 'scheduled night')
+
+
+def cmd_reboot_now(args):
+    return do_reboot(conf(), 'manual (ChatOps)')
+
+
+def cmd_approve_poll(args):
+    c = conf()
+    if c['PATCH_POLL_APPROVALS'] != 'yes' or not c['PATCH_NTFY_URL']:
+        return 0
+    try:
+        req = urllib.request.Request(c['PATCH_NTFY_URL'].rstrip('/') + '/json?poll=1&since=20m', headers={'User-Agent': 'patch-agent/1'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            lines = r.read().decode(errors='replace').splitlines()
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f'patch-agent: approval poll failed: {str(e)[:100]}', file=sys.stderr)
+        return 0
+    seen = stamp_read('last-approval')
+    newest = None
+    for line in lines:
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get('event') != 'message' or 'patch-approve' not in (m.get('tags') or []):
+            continue
+        if str(m.get('message', '')).strip() == c['PATCH_HOST'] and m.get('id') != seen and now().timestamp() - num(m.get('time'), 0) < 1200:
+            newest = m.get('id')
+    if not newest:
+        return 0
+    stamp_write('last-approval', newest)
+    return cmd_reboot_if_needed(['--approved'])
+
+
+def container_ok(name):
+    rc, out = sh(['docker', 'inspect', '-f', '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}', name], timeout=30)
+    if rc != 0:
+        return f'{name}: missing'
+    parts = out.split()
+    if not parts or parts[0] != 'true':
+        return f'{name}: not running'
+    if len(parts) > 1 and parts[1] == 'unhealthy':
+        return f'{name}: unhealthy'
+    return ''
+
+
+def boot_problems(c):
+    """What is not back yet (empty list = everything is)."""
+    out = []
+    rc, text = sh(['systemctl', 'is-active', 'docker'], timeout=30)
+    if rc != 0:
+        out.append('docker is not running')
+        return out
+    for name in c['PATCH_CONTAINERS'].split():
+        p = container_ok(name)
+        if p:
+            out.append(p)
+    ts = c['PATCH_TS_CONTAINER']
+    if ts:
+        rc, text = sh(['docker', 'exec', ts, 'tailscale', 'status'], timeout=30)
+        if rc != 0:
+            out.append(f'tailscale ({ts}) is not connected')
+    elif os.environ.get('PATCH_HOST_TAILSCALE', '') or sh(['which', 'tailscale'])[0] == 0:
+        rc, text = sh(['tailscale', 'status'], timeout=30)
+        if rc != 0:
+            out.append('tailscale is not connected')
+    pc = c['PATCH_PUSH_CONTAINER']
+    if pc:
+        p = container_ok(pc)
+        if p:
+            out.append('heartbeat sender ' + p)
+        else:
+            rc, logs = sh(['docker', 'logs', '--since', '3m', pc], timeout=30)
+            last_line = (logs.strip().splitlines() or [''])[-1]
+            if re.search(r'did not answer|does not answer', last_line):
+                out.append('heartbeat: the last push attempt failed (Kuma or the tailnet not reachable)')
+    return out
+
+
+def cmd_postboot(args):
+    c = conf()
+    grace, wait = num(c['PATCH_POSTBOOT_GRACE'], 90), num(c['PATCH_POSTBOOT_WAIT'], 600)
+    if '--no-wait' not in args:
+        time.sleep(grace)
+    deadline = time.time() + wait
+    problems = boot_problems(c)
+    while problems and time.time() < deadline and '--no-wait' not in args:
+        time.sleep(20)
+        problems = boot_problems(c)
+    expected = stamp_read('expect-reboot')
+    doc = {'v': VERSION, 'event': 'back' if not problems else 'broken', 'host': c['PATCH_HOST'], 'ts': iso(time.time()), 'expected': bool(expected), 'problems': problems, 'kuma': c['PATCH_KUMA'] == 'yes'}
+    if problems:
+        alert(c, f"{c['PATCH_HOST']}: rebooted{'' if expected else ' (not planned)'} and is NOT fully back: " + '; '.join(problems), 5, 'rotating_light')
+    feed(c, doc, 2 if problems else 1)
+    stamp_write('postboot.json', json.dumps(doc))
+    if expected:
+        try:
+            os.remove(os.path.join(state_dir(), 'expect-reboot'))
+        except OSError:
+            pass
+    print(json.dumps(doc))
+    return 1 if problems else 0
+
+
+def cmd_check_restart(args):
+    bad = no_restart_policy(conf())
+    if bad is None:
+        print('docker is not reachable')
+        return 2
+    print('\n'.join(bad) if bad else 'every running container has a restart policy')
+    return 1 if bad else 0
+
+
+COMMANDS = {'status': cmd_status, 'report': cmd_report, 'reboot-if-needed': cmd_reboot_if_needed, 'reboot-now': cmd_reboot_now, 'approve-poll': cmd_approve_poll, 'postboot': cmd_postboot, 'check-restart': cmd_check_restart}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ('-h', '--help') or argv[1] not in COMMANDS:
+        print(__doc__)
+        return 0 if len(argv) >= 2 and argv[1] in ('-h', '--help') else 2
+    return COMMANDS[argv[1]](argv[2:])
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

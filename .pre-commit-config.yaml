@@ -1,0 +1,7 @@
+# Install once on the laptop: pre-commit install   (see "Secret scanning" in README.md)
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    # v8.30.1 = commit 83d9cd684c87d95d656c1458ef04895a7f1cbd8e
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

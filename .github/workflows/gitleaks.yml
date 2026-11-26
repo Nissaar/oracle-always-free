@@ -1,0 +1,46 @@
+name: gitleaks
+
+# Secret scan on every push to main and every pull request (owner decision s-gitleaks).
+# Fails the run on a finding; --redact keeps secrets out of the log.
+# Why not gitleaks/gitleaks-action: it lists the PR's commits through the API and needs
+# pull-requests: read, but this repo's rule is permissions contents: read only. So the job
+# downloads the pinned gitleaks release binary, checks its sha256 (hard-coded below and against
+# the release's checksums file) and scans the full history of the checkout.
+# Rules: gitleaks defaults plus the narrow allowlist in .gitleaks.toml.
+# To bump: change GITLEAKS_VERSION and GITLEAKS_SHA256 together (sha from the release's checksums file).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          dir="$(mktemp -d)"
+          curl -fsSL -o "${dir}/${tarball}" "${base}/${tarball}"
+          curl -fsSL -o "${dir}/checksums.txt" "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          echo "${GITLEAKS_SHA256}  ${dir}/${tarball}" | sha256sum -c -
+          (cd "${dir}" && grep " ${tarball}\$" checksums.txt | sha256sum -c -)
+          tar -xzf "${dir}/${tarball}" -C "${dir}" gitleaks
+          sudo install -m 0755 "${dir}/gitleaks" /usr/local/bin/gitleaks
+      - name: Scan full history (fails on a finding)
+        run: gitleaks detect --source . --redact --no-banner --verbose

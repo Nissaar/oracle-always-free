@@ -1,0 +1,15 @@
+# Only for running OpenTofu from your own machine (scripts/bootstrap.sh writes bootstrap/terraform.tfvars for you).
+# Copy to terraform.tfvars (git-ignored) and replace EVERY <your-...> value. scripts/preflight.sh fails while one is left.
+# The full list of variables: docs/CONFIGURATION.md.
+
+# --- required
+tenancy_ocid      = "ocid1.tenancy.oc1..<your-tenancy-ocid>" # Console: profile menu -> Tenancy -> OCID -> Copy
+region            = "<your-home-region>"                      # for example eu-frankfurt-1: the HOME region of the tenancy
+alert_email       = "<your-email>"                            # budget alerts; also the contact address of the S3 users
+github_repository = "<your-github-user>/<your-private-repo>"  # YOUR private copy of this repository (owner/name)
+
+# --- optional (defaults shown)
+# oci_profile   = "oracle-always-free-admin" # profile of `oci session authenticate`
+# audit_email   = ""                         # change alerts; empty = alert_email
+# budget_amount = 1                          # alarm threshold in your billing currency
+# enable_quotas = true                       # keep true: quotas refuse anything that would cost money

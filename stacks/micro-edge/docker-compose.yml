@@ -1,0 +1,87 @@
+# micro-edge: Tailscale exit node + subnet router for the Oracle VCN (10.0.0.0/16), AdGuard Home,
+# and a read-only pull-through cache for ghcr.io (the GCP VM has no IPv4 and ghcr.io has no IPv6:
+# it pulls AutoKuma through this cache over the tailnet).
+#
+# AdGuard and the cache run inside the Tailscale container's network namespace: they answer on the
+# tailnet address only. Nothing is published to the internet except Tailscale's WireGuard port
+# (and the Oracle security list blocks everything else anyway).
+# Tailscale runs in kernel mode inside its own namespace:
+# the forwarding sysctls exist only in this container; the host's firewall and routes are untouched.
+# Memory caps add up to 480 MB (no swap: design choice); the VM has 1 GB.
+name: edge
+
+services:
+  tailscale:
+    image: ${TAILSCALE_IMAGE:-tailscale/tailscale:latest}   # pin a tag in .env if you want (docs/CONFIGURATION.md)
+    container_name: edge_tailscale
+    hostname: ${TS_HOSTNAME:-micro-edge}
+    restart: unless-stopped
+    environment:
+      - TS_HOSTNAME=${TS_HOSTNAME:-micro-edge}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+      - TS_ACCEPT_DNS=false                 # AdGuard is the DNS here; do not loop through it
+      - TS_AUTHKEY=${TS_AUTHKEY:-}          # optional: empty = log in with the link in `docker compose logs tailscale`
+      - TS_ROUTES=10.0.0.0/16               # subnet router for the VCN (approve it in the admin console)
+      - TS_EXTRA_ARGS=--advertise-exit-node
+      - TS_TAILSCALED_EXTRA_ARGS=--port=41641
+    volumes:
+      - ./state:/var/lib/tailscale
+      - ./resolv.conf:/etc/resolv.conf:ro   # Cloudflare directly: the exit node forwards its clients' DNS through eth0, which cannot reach Docker's 127.0.0.11 (phone showed dns-forward-failing, 12 Nov)
+      - /dev/net/tun:/dev/net/tun
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.forwarding=1
+    ports:
+      - "41641:41641/udp"                   # direct WireGuard connections (else through DERP relays)
+    networks: [edge]
+    mem_limit: 128m
+    memswap_limit: 128m
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL", "tailscale status --json >/dev/null 2>&1 || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # DNS on <micro-edge tailnet address>:53. First visit: http://micro-edge:3000 from a tailnet device
+  # (setup wizard: admin interface on all interfaces port 80, DNS on all interfaces port 53).
+  adguard:
+    image: ${ADGUARD_IMAGE:-adguard/adguardhome:latest}
+    container_name: edge_adguard
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on: [tailscale]
+    environment:
+      - TZ=UTC
+      - GOMEMLIMIT=200MiB                   # Go garbage-collects harder before the 256 MB cap kills it (12 Nov: nine blocklists, 21 OOM restarts)
+    volumes:
+      - ./adguard/work:/opt/adguardhome/work
+      - ./adguard/conf:/opt/adguardhome/conf     # live config: written from adguard/AdGuardHome.yaml (git) by adguard/apply.sh
+    mem_limit: 256m
+    memswap_limit: 256m
+
+  # http://micro-edge:5000/<owner>/<image>:<tag> = ghcr.io/<owner>/<image>:<tag>. Read-only (proxy mode
+  # refuses pushes). Tags are checked against ghcr.io on every pull, so floating tags stay current;
+  # cached layers expire after 7 days of no use.
+  ghcr-cache:
+    image: ${REGISTRY_IMAGE:-registry:latest}
+    container_name: edge_ghcr_cache
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on: [tailscale]
+    environment:
+      - REGISTRY_HTTP_ADDR=:5000
+      - REGISTRY_PROXY_REMOTEURL=https://ghcr.io
+      - REGISTRY_PROXY_TTL=168h
+      - REGISTRY_STORAGE_DELETE_ENABLED=true
+      - OTEL_TRACES_EXPORTER=none
+    volumes:
+      - ./ghcr-cache:/var/lib/registry
+    mem_limit: 96m
+    memswap_limit: 96m
+
+networks:
+  edge: {}

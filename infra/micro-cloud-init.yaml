@@ -1,0 +1,35 @@
+#cloud-config
+# Template (micros.tf): Docker + this micro's stack from stacks/${stack}/ in /opt/stacks/${stack}.
+# No swap (design choice). Secrets never come through here: the stack's .env is a manual step
+# (docs/WHAT-YOU-DO.md). Runs on the first boot only; later stack changes are copied by hand, and the patching
+# setup of a machine that already exists is applied by patch/apply-patching.sh (patch/README.md).
+package_update: true
+package_upgrade: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - unattended-upgrades
+write_files:
+%{ for name, content in files ~}
+  - path: /opt/stacks/${stack}/${name}
+    encoding: b64
+    content: ${content}
+    permissions: "${endswith(name, ".sh") ? "0755" : "0644"}"
+%{ endfor ~}
+%{ for name, content in patch_files ~}
+  - path: /opt/patch/${name}
+    encoding: gz+b64
+    content: ${content}
+    permissions: "0755"
+%{ endfor ~}
+runcmd:
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu
+  # Tailscale runs in a container with its UDP port published; Docker's own FORWARD rules sit in
+  # front of the REJECT rules Oracle's Ubuntu image ships, so no host firewall change is needed.
+%{ if autostart ~}
+  - cd /opt/stacks/${stack} && docker compose up -d
+%{ endif ~}
+  # OS patching (patch/README.md): security updates daily, no automatic reboot (mode ${patch_reboot_mode}), post-boot check, reboot reminders. Night: Friday.
+  # Idempotent; secrets (ntfy topic, Kuma push URL) go into /etc/patch-agent.env by hand. A failure here must not stop the stack: it is the last step.
+  - /opt/patch/apply-patching.sh --host ${stack} --day fri --mode ${patch_reboot_mode} ${patch_args} || echo apply-patching.sh failed, see the lines above

@@ -1,0 +1,245 @@
+// DRAFT Tailscale access policy ("tag the machines and restrict"), NOT applied to any tailnet.
+// Validated only offline (tailscale/check.py) and by Tailscale's own policy tests (the "tests" and
+// "sshTests" sections below, evaluated when you press Save). Read tailscale/README.md first.
+//
+// Model: your own devices (phone, laptop) are untagged and belong to you; every server is a tagged
+// device. A tagged device can only do what a grant below says. No grant has a tagged device as its
+// destination for another server unless the reason is written above it.
+//
+// Placeholders to replace before use (README step 2): owner@example.com (twice: groups + tests)
+// and the "vcn" address range under "hosts". The checker's --final switch refuses the placeholders.
+{
+  "groups": {
+    // Your Tailscale login. Phone and laptop are your user-owned devices, so this one group
+    // covers both. Nothing else is in it: a second person or a stolen server gets no owner rights.
+    "group:owner": ["owner@example.com"],
+  },
+
+  "hosts": {
+    // The Oracle network (VCN) that micro-edge advertises as a subnet route. Only used for the
+    // SSH rule. PLACEHOLDER (documentation range): put the VCN range from oracle-always-free's network
+    // settings (the same range you ticked under "Edit route settings" for micro-edge).
+    "vcn": "192.0.2.0/24",
+  },
+
+  "tagOwners": {
+    // oke-free, the Tailscale Kubernetes operator in the Oracle cluster (API server proxy).
+    // Name fixed by cluster: operatorConfig.defaultTags.
+    "tag:k8s-operator": ["autogroup:admin"],
+    // Proxies the operator creates (today: the egress to Home's ntfy). Owned by the operator
+    // so it may create them with its OAuth client; name fixed by cluster: proxyConfig.defaultTags.
+    "tag:k8s": ["tag:k8s-operator"],
+    // The ChatOps sidecar on the Home server (device "chatops": kubectl client and private ntfy).
+    "tag:chatops": ["autogroup:admin"],
+    // The Home Kuma sidecar (device "kuma-home"): serves the push URLs and the Gogs git mirror.
+    "tag:kuma-hub": ["autogroup:admin"],
+    // The two remote Kumas (devices "kuma-oracle" on micro-kuma and "kuma-gcp" on the Google VM).
+    "tag:kuma": ["autogroup:admin"],
+    // The exit nodes: micro-edge (also subnet router, AdGuard DNS, ghcr.io cache) and exit-vps.
+    "tag:edge": ["autogroup:admin"],
+  },
+
+  // No "acls" and no catch-all rule: what is not listed below is denied.
+  "grants": [
+    // OWNER -> EVERY TAG, all ports: you administer all servers (Kuma UIs, AdGuard, ChatOps ntfy,
+    // the cluster). The only way in from your devices; the servers get no way back (see below).
+    {
+      "src": ["group:owner"],
+      "dst": ["tag:k8s-operator", "tag:k8s", "tag:chatops", "tag:kuma-hub", "tag:kuma", "tag:edge"],
+      "ip":  ["*"],
+    },
+
+    // OWNER -> ORACLE NETWORK, SSH only: ssh/scp to the micros goes through micro-edge's subnet
+    // route to the VCN (plain sshd, not Tailscale SSH). Port 22 only, so the owner cannot open
+    // arbitrary VCN ports by accident and a stolen laptop is not a free VCN scanner.
+    {
+      "src": ["group:owner"],
+      "dst": ["vcn"],
+      "ip":  ["tcp:22"],
+    },
+
+    // OWNER -> INTERNET via an exit node: lets your phone/laptop choose micro-edge or exit-vps as
+    // exit node (public Wi-Fi). Without it, "Use exit node" shows but carries no traffic.
+    {
+      "src": ["group:owner"],
+      "dst": ["autogroup:internet"],
+      "ip":  ["*"],
+    },
+
+    // OWNER -> CLUSTER AS ADMIN: kubectl through oke-free is mapped to the Kubernetes group
+    // system:masters (cluster-admin). Same grant as cluster docs/WHAT-YOU-DO.md step 4, with the
+    // owner group instead of autogroup:admin. 443 is the API server proxy port.
+    {
+      "src": ["group:owner"],
+      "dst": ["tag:k8s-operator"],
+      "ip":  ["tcp:443"],
+      "app": {
+        "tailscale.com/cap/kubernetes": [
+          { "impersonate": { "groups": ["system:masters"] } },
+        ],
+      },
+    },
+
+    // CHATOPS -> CLUSTER API, port 443 only: the ChatOps `cluster` channel runs kubectl through the
+    // API server proxy as the Kubernetes group "chatops" (read most things, restart/suspend; no
+    // Secrets: cluster/infrastructure/configs/tailscale/rbac-chatops.yaml). It gets nothing else.
+    {
+      "src": ["tag:chatops"],
+      "dst": ["tag:k8s-operator"],
+      "ip":  ["tcp:443"],
+      "app": {
+        "tailscale.com/cap/kubernetes": [
+          { "impersonate": { "groups": ["chatops"] } },
+        ],
+      },
+    },
+
+    // CLUSTER -> CHATOPS ntfy, port 443: Alertmanager, the restore test and PR previews post to the
+    // private ntfy through the operator's egress proxy (tag:k8s). The one flow server-to-server
+    // that goes toward Home; the proxy cannot reach anything else.
+    {
+      "src": ["tag:k8s"],
+      "dst": ["tag:chatops"],
+      "ip":  ["tcp:443"],
+    },
+
+    // REMOTE KUMAS -> HOME KUMA, port 443: git sync of the monitor files (Gogs mirror on "/")
+    // and the 60-second push heartbeat (/api/push/), both served by the kuma-home sidecar.
+    {
+      "src": ["tag:kuma"],
+      "dst": ["tag:kuma-hub"],
+      "ip":  ["tcp:443"],
+    },
+
+    // REMOTE KUMAS -> GHCR CACHE, port 5000: the Google VM (IPv6 only) pulls the AutoKuma image
+    // through micro-edge's read-only pull-through cache. The Oracle Kuma does not need it but is
+    // in the same tag; harmless (public images, read-only). Exit-vps is tag:edge too and has
+    // nothing on 5000.
+    {
+      "src": ["tag:kuma"],
+      "dst": ["tag:edge"],
+      "ip":  ["tcp:5000"],
+    },
+  ],
+
+  // Tailscale SSH is not used anywhere in the repos: ssh to the micros is plain sshd through the
+  // VCN route (grant above), the Google VM is reached through Google's IAP, the Home server by
+  // its own sshd. An empty list = no one may use Tailscale SSH to any device, explicitly.
+  // (If you ever want it: add a rule { "action": "check", "src": ["group:owner"], "dst": ["tag:edge"],
+  // "users": ["root"] } and a matching sshTests entry, and tag the device with --ssh.)
+  "ssh": [],
+
+  // Policy tests: Tailscale runs these when you press Save and REFUSES the policy if one fails.
+  // For every grant: an accept case (the flow works) and deny cases (the neighbours stay closed).
+  // dst is "target:port"; proto tcp. Rule 3 (exit node, autogroup:internet) cannot be written as a
+  // test target: tailscale/check.py covers it, and README step 8 checks it by hand.
+  "tests": [
+    // Rule 1, owner -> every tag: accepted everywhere, even on odd ports; denied to the VCN port
+    // that is not SSH (rule 2 is SSH only) so the grants do not leak into each other.
+    {
+      "src": "owner@example.com",
+      "proto": "tcp",
+      "accept": [
+        "tag:k8s-operator:443", "tag:k8s:443", "tag:chatops:443", "tag:kuma-hub:443",
+        "tag:kuma:443", "tag:edge:3000", "tag:edge:53", "tag:kuma:22",
+      ],
+      "deny": ["vcn:443", "vcn:6443", "vcn:80"],
+    },
+    // Rule 2, owner -> VCN: SSH accepted.
+    {
+      "src": "owner@example.com",
+      "proto": "tcp",
+      "accept": ["vcn:22"],
+    },
+    // Rule 4, owner -> API proxy: kubectl port accepted (the impersonation itself cannot be tested here).
+    {
+      "src": "owner@example.com",
+      "proto": "tcp",
+      "accept": ["tag:k8s-operator:443"],
+    },
+    // Rule 5, ChatOps: only the API proxy port. Denied: every other port there, every other
+    // tag, the VCN (and so the micros), i.e. a hijacked ChatOps cannot pivot.
+    {
+      "src": "tag:chatops",
+      "proto": "tcp",
+      "accept": ["tag:k8s-operator:443"],
+      "deny": [
+        "tag:k8s-operator:80", "tag:k8s-operator:6443", "tag:k8s-operator:22",
+        "tag:k8s:443", "tag:kuma-hub:443", "tag:kuma:443", "tag:kuma:22", "tag:edge:53",
+        "tag:edge:5000", "tag:edge:22", "vcn:22", "vcn:443",
+      ],
+    },
+    // Rule 6, cluster proxies -> ChatOps ntfy 443 only. Denied: other ChatOps ports, the operator
+    // itself, the Kumas, the edge machines, the VCN.
+    {
+      "src": "tag:k8s",
+      "proto": "tcp",
+      "accept": ["tag:chatops:443"],
+      "deny": [
+        "tag:chatops:22", "tag:chatops:8080", "tag:k8s-operator:443", "tag:kuma-hub:443",
+        "tag:kuma:443", "tag:edge:53", "tag:edge:5000", "vcn:22",
+      ],
+    },
+    // The operator machine itself (oke-free) has no outgoing rule: it must not reach any server.
+    {
+      "src": "tag:k8s-operator",
+      "proto": "tcp",
+      "deny": [
+        "tag:chatops:443", "tag:k8s:443", "tag:kuma-hub:443", "tag:kuma:443",
+        "tag:edge:5000", "tag:edge:53", "vcn:22",
+      ],
+    },
+    // Rule 7 and 8, remote Kumas: Home Kuma 443 and the ghcr cache 5000 only. Denied: Home
+    // Kuma's other ports, the cache host's other ports (DNS, AdGuard UI, SSH), ChatOps, the
+    // cluster, the other Kuma, the VCN.
+    {
+      "src": "tag:kuma",
+      "proto": "tcp",
+      "accept": ["tag:kuma-hub:443", "tag:edge:5000"],
+      "deny": [
+        "tag:kuma-hub:22", "tag:kuma-hub:3001", "tag:edge:53", "tag:edge:3000", "tag:edge:22",
+        "tag:chatops:443", "tag:k8s-operator:443", "tag:k8s:443", "tag:kuma:443", "vcn:22",
+      ],
+    },
+    // The Home Kuma sidecar only answers: it opens nothing toward the tailnet.
+    {
+      "src": "tag:kuma-hub",
+      "proto": "tcp",
+      "deny": [
+        "tag:kuma:443", "tag:chatops:443", "tag:k8s-operator:443", "tag:k8s:443",
+        "tag:edge:5000", "tag:edge:53", "vcn:22",
+      ],
+    },
+    // The exit nodes / DNS / cache host only answer: they open nothing toward the tailnet or the VCN.
+    {
+      "src": "tag:edge",
+      "proto": "tcp",
+      "deny": [
+        "tag:kuma:443", "tag:kuma-hub:443", "tag:chatops:443", "tag:k8s-operator:443",
+        "tag:k8s:443", "vcn:22",
+      ],
+    },
+  ],
+
+  // SSH tests (Tailscale SSH): nobody may use it, as the empty "ssh" list says. Run on Save, too.
+  "sshTests": [
+    // You on a server device: refused, ssh goes through the VCN route or the cloud's own path.
+    {
+      "src": "owner@example.com",
+      "dst": ["tag:edge", "tag:kuma", "tag:chatops", "tag:kuma-hub"],
+      "deny": ["root"],
+    },
+    // A hijacked ChatOps: refused on the edge machines, the Kumas and the cluster.
+    {
+      "src": "tag:chatops",
+      "dst": ["tag:edge", "tag:kuma", "tag:kuma-hub", "tag:k8s-operator"],
+      "deny": ["root"],
+    },
+    // A hijacked remote Kuma: refused on the Home Kuma, the edge machines and ChatOps.
+    {
+      "src": "tag:kuma",
+      "dst": ["tag:edge", "tag:kuma-hub", "tag:chatops"],
+      "deny": ["root"],
+    },
+  ],
+}
